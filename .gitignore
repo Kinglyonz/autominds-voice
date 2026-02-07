@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Environment / Secrets
+.env
+*.pem
+*.key
+gog_token.json
+Credentials.json
+
+# SQLite memory (backed up to Drive)
+*.db
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
