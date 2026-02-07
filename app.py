@@ -5,7 +5,7 @@ Handles all Twilio voice conversations with Gemini AI + Google Workspace
 Persistent memory via SQLite + Google Drive backup
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client as TwilioClient
 import os
@@ -13,6 +13,9 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
+import io
+import hashlib
 from datetime import datetime, timezone
 
 app = Flask(__name__)
@@ -25,6 +28,81 @@ VOICE_URL = os.environ.get('VOICE_URL', 'https://autominds-voice-production.up.r
 
 # Google tokens (stored as env var JSON)
 GOOGLE_TOKENS = os.environ.get('GOOGLE_TOKENS', '')
+
+# ElevenLabs TTS (for human-sounding voice)
+ELEVENLABS_API_KEY = os.environ.get('ELEVENLABS_API_KEY', '')
+# Eric = smooth, trustworthy American voice
+ELEVENLABS_VOICE_ID = os.environ.get('ELEVENLABS_VOICE_ID', 'cjVigY5qzO86Huf0OWal')
+ELEVENLABS_MODEL = 'eleven_turbo_v2_5'  # Lowest latency model
+
+# Audio cache: stores generated TTS audio in memory
+_audio_cache = {}
+_audio_lock = threading.Lock()
+
+
+def generate_elevenlabs_audio(text):
+    """Generate natural-sounding speech using ElevenLabs TTS.
+    Returns (audio_id, audio_bytes) or (None, None) on failure."""
+    if not ELEVENLABS_API_KEY:
+        return None, None
+    try:
+        import urllib.request
+        url = f'https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}'
+        payload = json.dumps({
+            'text': text,
+            'model_id': ELEVENLABS_MODEL,
+            'voice_settings': {
+                'stability': 0.5,
+                'similarity_boost': 0.75,
+                'style': 0.4,
+                'use_speaker_boost': True
+            }
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                'xi-api-key': ELEVENLABS_API_KEY,
+                'Content-Type': 'application/json',
+                'Accept': 'audio/mpeg'
+            },
+            method='POST'
+        )
+        # Use ulaw_8000 for best Twilio quality
+        req.full_url = url + '?output_format=ulaw_8000'
+        resp = urllib.request.urlopen(req, timeout=10)
+        audio_bytes = resp.read()
+        audio_id = hashlib.md5(text.encode()).hexdigest()[:12]
+        with _audio_lock:
+            _audio_cache[audio_id] = {
+                'data': audio_bytes,
+                'created': time.time(),
+                'format': 'ulaw'
+            }
+        # Clean old cache entries (keep last 50)
+        with _audio_lock:
+            if len(_audio_cache) > 50:
+                oldest = sorted(_audio_cache.keys(), key=lambda k: _audio_cache[k]['created'])[:20]
+                for k in oldest:
+                    del _audio_cache[k]
+        print(f'[TTS] ElevenLabs generated {len(audio_bytes)} bytes for: {text[:50]}...')
+        return audio_id, audio_bytes
+    except Exception as e:
+        print(f'[TTS] ElevenLabs failed: {e}')
+        return None, None
+
+
+def speak(response_or_gather, text, fallback_voice='Google.en-US-Neural2-F'):
+    """Speak text using ElevenLabs audio (Play) or fallback to Twilio voice (Say).
+    Works with both VoiceResponse and Gather objects."""
+    audio_id, _ = generate_elevenlabs_audio(text)
+    if audio_id:
+        # Use Play with our served audio
+        response_or_gather.play(f'{VOICE_URL}/audio/{audio_id}')
+    else:
+        # Fallback to best available Twilio neural voice
+        response_or_gather.say(text, voice=fallback_voice)
+    return response_or_gather
 
 # --- Persistent Memory System ---
 DB_PATH = os.environ.get('MEMORY_DB_PATH', '/tmp/autominds_memory.db')
@@ -354,13 +432,28 @@ def get_calendar_service():
 
 @app.route('/', methods=['GET'])
 def home():
-    return {'status': 'AutoMinds Voice Service Running', 'version': '2.0-memory'}, 200
+    return {'status': 'AutoMinds Voice Service Running', 'version': '3.0-elevenlabs'}, 200
 
 
 @app.route('/health', methods=['GET'])
 def health():
     return {'status': 'healthy', 'active_calls': len(active_calls),
-            'memory_db': os.path.exists(DB_PATH)}, 200
+            'memory_db': os.path.exists(DB_PATH),
+            'elevenlabs': bool(ELEVENLABS_API_KEY),
+            'cached_audio': len(_audio_cache)}, 200
+
+
+@app.route('/audio/<audio_id>', methods=['GET'])
+def serve_audio(audio_id):
+    """Serve generated ElevenLabs audio to Twilio"""
+    with _audio_lock:
+        entry = _audio_cache.get(audio_id)
+    if not entry:
+        return 'Audio not found', 404
+    return entry['data'], 200, {
+        'Content-Type': 'audio/basic',  # ulaw format
+        'Cache-Control': 'no-cache'
+    }
 
 
 @app.route('/memory/stats', methods=['GET'])
@@ -405,27 +498,27 @@ def voice_incoming():
 
     # Check if we have history with this caller
     msg_count = get_message_count(from_number)
-    memories = get_memories(from_number)
 
     # Personalized greeting based on memory
     if msg_count > 0:
-        greeting = f"Hey Khalil, welcome back! We've had {msg_count} exchanges so far. What's on your mind?"
+        greeting = "Hey Khalil, welcome back. What's on your mind?"
     else:
-        greeting = "Hey Khalil! I'm your AI assistant, connected to your Gmail, Calendar, and Drive. I remember everything we talk about. What do you need?"
+        greeting = "Hey Khalil! I'm your AI assistant. What do you need?"
 
     gather = Gather(
         input='speech',
         action='/voice/process',
-        timeout=3,
+        timeout=5,
         speech_timeout='auto',
         language='en-US',
-        hints='help, status, goals, opportunities, leads, revenue, remember, recall'
+        hints='help, status, goals, email, calendar, schedule, remember'
     )
-    gather.say(greeting, voice='Polly.Joanna')
+    speak(gather, greeting)
 
     response.append(gather)
-    response.say("I didn't catch that. What can I help you with?", voice='Polly.Joanna')
-    response.redirect('/voice/incoming')
+    # If no speech detected, try once more then hang up
+    speak(response, "I didn't catch anything. Call me back when you're ready.")
+    response.hangup()
 
     return str(response), 200, {'Content-Type': 'text/xml'}
 
@@ -435,24 +528,32 @@ def voice_process():
     """Process speech and respond with AI"""
     response = VoiceResponse()
     speech = request.form.get('SpeechResult', '')
+    confidence = request.form.get('Confidence', '0')
     from_number = request.form.get('From', '')
 
-    print(f"[VOICE] {from_number} said: {speech}")
+    print(f"[VOICE] {from_number} said: {speech} (confidence: {confidence})")
 
     if not speech:
-        response.say("I didn't hear anything. Let's try again.", voice='Polly.Joanna')
-        response.redirect('/voice/incoming')
+        gather = Gather(
+            input='speech',
+            action='/voice/process',
+            timeout=5,
+            speech_timeout='auto',
+            language='en-US'
+        )
+        speak(gather, "Sorry, I didn't catch that. Can you say it again?")
+        response.append(gather)
+        # Don't loop forever - if still nothing, end gracefully
+        speak(response, "Seems like the connection is rough. Call me back anytime.")
+        response.hangup()
         return str(response), 200, {'Content-Type': 'text/xml'}
 
     # Save user message to persistent memory
     save_message(from_number, 'user', speech)
 
     # Check for goodbye
-    if any(word in speech.lower() for word in ['goodbye', 'bye', 'hang up', 'end call', 'that\'s all']):
-        response.say(
-            "Great talking with you! Everything we discussed is saved in my memory. Talk soon!",
-            voice='Polly.Joanna'
-        )
+    if any(word in speech.lower() for word in ['goodbye', 'bye', 'hang up', 'end call', "that's all", 'thanks that is all']):
+        speak(response, "Great talking with you! Everything's saved in my memory. Talk soon!")
         response.hangup()
         active_calls.pop(from_number, None)
         # Summarize this conversation and backup
@@ -468,7 +569,9 @@ def voice_process():
         ai_response = get_ai_response(speech, from_number)
     except Exception as e:
         print(f"[ERROR] AI response failed: {e}")
-        ai_response = "I'm having trouble connecting right now. Can you try asking again?"
+        import traceback
+        traceback.print_exc()
+        ai_response = "Hmm, let me think about that differently. Can you rephrase?"
 
     print(f"[VOICE] AI responds: {ai_response}")
 
@@ -485,15 +588,16 @@ def voice_process():
     gather = Gather(
         input='speech',
         action='/voice/process',
-        timeout=3,
+        timeout=5,
         speech_timeout='auto',
         language='en-US'
     )
-    gather.say(ai_response, voice='Polly.Joanna')
+    speak(gather, ai_response)
     response.append(gather)
 
-    response.say("Anything else?", voice='Polly.Joanna')
-    response.redirect('/voice/process')
+    # If silence after response, prompt once then end
+    speak(response, "Still there? Call back anytime you need me.")
+    response.hangup()
 
     return str(response), 200, {'Content-Type': 'text/xml'}
 
@@ -553,7 +657,7 @@ def summarize_and_extract(phone):
     try:
         import google.generativeai as genai
         genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        model = genai.GenerativeModel('gemini-2.0-flash')
 
         # Get unsummarized messages
         all_msgs = get_all_history(phone)
@@ -655,7 +759,7 @@ def get_gemini_response(user_speech, history_text, workspace_context="", memorie
         import google.generativeai as genai
 
         genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        model = genai.GenerativeModel('gemini-2.0-flash')
 
         # Build memory sections
         memory_section = ""
@@ -702,7 +806,9 @@ Your helpful, natural response (remember: SHORT for phone):"""
 
     except Exception as e:
         print(f"[ERROR] Gemini failed: {e}")
-        return f"I heard you, but I'm having a moment connecting to my brain. Can you try again?"
+        import traceback
+        traceback.print_exc()
+        return "Let me think about that... actually, could you ask me in a different way?"
 
 
 @app.route('/voice/status', methods=['POST'])
