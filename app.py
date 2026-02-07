@@ -35,9 +35,9 @@ ELEVENLABS_API_KEY = os.environ.get('ELEVENLABS_API_KEY', '')
 ELEVENLABS_VOICE_ID = os.environ.get('ELEVENLABS_VOICE_ID', 'cjVigY5qzO86Huf0OWal')
 ELEVENLABS_MODEL = 'eleven_turbo_v2_5'  # Lowest latency model
 
-# Audio cache: stores generated TTS audio in memory
-_audio_cache = {}
-_audio_lock = threading.Lock()
+# Audio cache: stores generated TTS audio on disk (/tmp/) so all gunicorn workers can access
+AUDIO_CACHE_DIR = '/tmp/autominds_audio'
+os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
 
 def generate_elevenlabs_audio(text):
@@ -46,6 +46,12 @@ def generate_elevenlabs_audio(text):
     if not ELEVENLABS_API_KEY:
         return None, None
     try:
+        audio_id = hashlib.md5(text.encode()).hexdigest()[:12]
+        audio_path = os.path.join(AUDIO_CACHE_DIR, f'{audio_id}.ulaw')
+        # Return cached file if it exists
+        if os.path.exists(audio_path):
+            print(f'[TTS] Cache hit for: {text[:50]}...')
+            return audio_id, open(audio_path, 'rb').read()
         import urllib.request
         url = f'https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}'
         payload = json.dumps({
@@ -72,19 +78,20 @@ def generate_elevenlabs_audio(text):
         req.full_url = url + '?output_format=ulaw_8000'
         resp = urllib.request.urlopen(req, timeout=10)
         audio_bytes = resp.read()
-        audio_id = hashlib.md5(text.encode()).hexdigest()[:12]
-        with _audio_lock:
-            _audio_cache[audio_id] = {
-                'data': audio_bytes,
-                'created': time.time(),
-                'format': 'ulaw'
-            }
-        # Clean old cache entries (keep last 50)
-        with _audio_lock:
-            if len(_audio_cache) > 50:
-                oldest = sorted(_audio_cache.keys(), key=lambda k: _audio_cache[k]['created'])[:20]
-                for k in oldest:
-                    del _audio_cache[k]
+        # Write to disk so all workers can serve it
+        with open(audio_path, 'wb') as f:
+            f.write(audio_bytes)
+        # Clean old cache files (keep last 50)
+        try:
+            files = sorted(
+                [os.path.join(AUDIO_CACHE_DIR, f) for f in os.listdir(AUDIO_CACHE_DIR)],
+                key=os.path.getmtime
+            )
+            if len(files) > 50:
+                for old_file in files[:len(files) - 50]:
+                    os.remove(old_file)
+        except Exception:
+            pass
         print(f'[TTS] ElevenLabs generated {len(audio_bytes)} bytes for: {text[:50]}...')
         return audio_id, audio_bytes
     except Exception as e:
@@ -437,23 +444,28 @@ def home():
 
 @app.route('/health', methods=['GET'])
 def health():
+    try:
+        cached_count = len(os.listdir(AUDIO_CACHE_DIR))
+    except Exception:
+        cached_count = 0
     return {'status': 'healthy', 'active_calls': len(active_calls),
             'memory_db': os.path.exists(DB_PATH),
             'elevenlabs': bool(ELEVENLABS_API_KEY),
-            'cached_audio': len(_audio_cache)}, 200
+            'cached_audio': cached_count}, 200
 
 
 @app.route('/audio/<audio_id>', methods=['GET'])
 def serve_audio(audio_id):
-    """Serve generated ElevenLabs audio to Twilio"""
-    with _audio_lock:
-        entry = _audio_cache.get(audio_id)
-    if not entry:
+    """Serve generated ElevenLabs audio to Twilio (from disk)"""
+    audio_path = os.path.join(AUDIO_CACHE_DIR, f'{audio_id}.ulaw')
+    if not os.path.exists(audio_path):
+        print(f'[TTS] Audio not found: {audio_id}')
         return 'Audio not found', 404
-    return entry['data'], 200, {
-        'Content-Type': 'audio/basic',  # ulaw format
-        'Cache-Control': 'no-cache'
-    }
+    return send_file(
+        audio_path,
+        mimetype='audio/basic',
+        download_name=f'{audio_id}.ulaw'
+    )
 
 
 @app.route('/memory/stats', methods=['GET'])
